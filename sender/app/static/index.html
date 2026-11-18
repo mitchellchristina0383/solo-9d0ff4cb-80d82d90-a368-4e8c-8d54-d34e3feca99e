@@ -36,6 +36,17 @@
   .muted { color: #9aa5b1; font-size: 12px; }
   .toolbar { display: flex; gap: 8px; align-items: center; margin-bottom: 10px; }
   .err-text { color: #c0392b; font-size: 12px; max-width: 220px; word-break: break-all; }
+  .attr-ok { color: #1c7c43; font-weight: 600; }
+  .attr-warn { color: #8a6d1a; font-weight: 600; }
+  .attr-bad { color: #c0392b; font-weight: 600; }
+  details summary { cursor: pointer; color: #0967d2; font-size: 12px; white-space: nowrap; }
+  table.inner { margin-top: 6px; background: #f8f9fa; }
+  table.inner th, table.inner td { padding: 4px 6px; font-size: 12px; border-bottom: 1px solid #e4e7eb; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; }
+  .o-RECORDED { color: #1c7c43; }
+  .o-DEDUP { color: #0967d2; }
+  .o-UNREACHABLE, .o-HTTP_ERROR, .o-INTERRUPTED { color: #8a6d1a; }
+  .o-CONFLICT, .o-CONTENT_MISMATCH { color: #c0392b; }
 </style>
 </head>
 <body>
@@ -75,7 +86,7 @@
     </div>
     <table>
       <thead>
-        <tr><th>ID</th><th>环境</th><th>发布号</th><th>结果</th><th>状态</th><th>尝试</th><th>回执</th><th>最近错误</th><th>更新时间 (UTC)</th><th>操作</th></tr>
+        <tr><th>ID</th><th>环境</th><th>发布号</th><th>结果</th><th>状态</th><th>尝试</th><th>首次入账尝试</th><th>回执</th><th>最近错误</th><th>更新时间 (UTC)</th><th>操作</th></tr>
       </thead>
       <tbody id="rows"></tbody>
     </table>
@@ -83,6 +94,11 @@
 </main>
 <script>
 const STATUS_LABEL = { PENDING: "待发送", UNCERTAIN: "待核", ACKED: "已确认", CONFLICT: "冲突" };
+const OUTCOME_LABEL = {
+  IN_FLIGHT: "进行中", RECORDED: "首次入账", DEDUP: "已存在·幂等", CONFLICT: "冲突",
+  CONTENT_MISMATCH: "内容不一致", HTTP_ERROR: "HTTP 异常", UNREACHABLE: "不可达/超时",
+  INTERRUPTED: "结果未知(重启)",
+};
 
 async function api(path, opts) {
   const r = await fetch(path, opts);
@@ -97,12 +113,53 @@ function showMsg(text, ok) {
   el.className = ok ? "ok" : "err";
 }
 
+function attributionHtml(n) {
+  if (n.attribution === "TRACED") {
+    return '<span class="attr-warn">第 ' + n.first_attempt_no + " 次尝试（" + n.attempts.length + " 次中）</span>";
+  }
+  if (n.attribution === "UNTRACEABLE") return '<span class="attr-warn">无法追溯（回执无尝试标识）</span>';
+  if (n.attribution === "FOREIGN") return '<span class="attr-warn">无法追溯（标识不属于本端尝试）</span>';
+  if (n.attribution === "UNKNOWN") return '<span class="muted">未知（待核对/接收端失联）</span>';
+  return '<span class="muted">—</span>';
+}
+
 function report(d) {
   if (!d || !d.status) { showMsg("操作失败", false); return; }
-  if (d.status === "ACKED") showMsg("已确认送达（回执 #" + (d.receipt_id ?? "?") + "）", true);
+  if (d.status === "ACKED") {
+    showMsg("已确认送达（回执 #" + (d.receipt_id ?? "?") + "，" + attributionText(d) + "）", true);
+  }
   else if (d.status === "CONFLICT") showMsg("冲突：" + (d.last_error || "内容不一致"), false);
-  else if (d.status === "UNCERTAIN") showMsg("未拿到回执，状态=待核：" + (d.last_error || ""), false);
+  else if (d.status === "UNCERTAIN") showMsg("未拿到回执，状态=待核：" + (d.last_error || "") + "；首次入账尝试未知", false);
   else showMsg((d.note ? d.note + "；" : "") + "当前状态：" + (STATUS_LABEL[d.status] || d.status), true);
+}
+
+function attributionText(n) {
+  if (n.attribution === "TRACED") return "首次入账为第 " + n.first_attempt_no + " 次尝试";
+  if (n.attribution === "UNTRACEABLE") return "首次入账尝试无法追溯";
+  if (n.attribution === "FOREIGN") return "首次入账尝试无法追溯";
+  return "首次入账尝试未知";
+}
+
+function attemptsRow(n) {
+  const wrap = document.createElement("tr");
+  const td = document.createElement("td");
+  td.colSpan = 11;
+  let html = '<table class="inner"><thead><tr><th>序号</th><th>尝试标识</th><th>结果</th><th>HTTP</th><th>说明</th><th>开始</th><th>结束</th></tr></thead><tbody>';
+  for (const a of (n.attempts || [])) {
+    const first = a.attempt_id && a.attempt_id === n.receipt_first_attempt_id;
+    html += "<tr><td>" + a.attempt_no + (first ? " ★" : "") + "</td>" +
+      '<td class="mono">' + esc(a.attempt_id) + "</td>" +
+      '<td class="o-' + a.outcome + '">' + (OUTCOME_LABEL[a.outcome] || a.outcome) + "</td>" +
+      "<td>" + (a.http_status ?? "—") + "</td>" +
+      '<td class="muted">' + esc(a.detail || "") + "</td>" +
+      '<td class="muted mono">' + esc(a.started_at || "") + "</td>" +
+      '<td class="muted mono">' + esc(a.finished_at || "") + "</td></tr>";
+  }
+  if (!(n.attempts || []).length) html += '<tr><td colspan="7" class="muted">尚无发送尝试</td></tr>';
+  html += "</tbody></table>";
+  td.innerHTML = html;
+  wrap.appendChild(td);
+  return wrap;
 }
 
 async function load() {
@@ -112,15 +169,28 @@ async function load() {
   for (const n of (data.items || [])) {
     const tr = document.createElement("tr");
     const receipt = n.receipt_id ? "#" + n.receipt_id : "—";
+    let attemptsCell = String(n.attempt_count);
+    if ((n.attempts || []).length) {
+      attemptsCell += ' <details><summary>明细</summary></details>';
+    }
     tr.innerHTML =
       "<td>" + n.id + "</td><td>" + esc(n.env) + "</td><td>" + esc(n.release_no) + "</td>" +
       "<td>" + esc(n.result) + "</td>" +
       '<td><span class="badge b-' + n.status + '">' + (STATUS_LABEL[n.status] || n.status) + "</span></td>" +
-      "<td>" + n.attempt_count + "</td><td>" + receipt + "</td>" +
+      "<td>" + attemptsCell + "</td>" +
+      "<td>" + attributionHtml(n) + "</td><td>" + receipt + "</td>" +
       '<td class="err-text">' + esc(n.last_error || "") + "</td>" +
       '<td class="muted">' + esc(n.updated_at || "") + "</td>" +
       '<td><button class="small" data-act="send">发送/重试</button> ' +
       '<button class="small ghost" data-act="reconcile">核对</button></td>';
+    const details = tr.querySelector("details");
+    if (details) {
+      const detailRow = attemptsRow(n);
+      details.addEventListener("toggle", () => {
+        if (details.open) tbody.insertBefore(detailRow, tr.nextSibling);
+        else if (detailRow.parentNode) detailRow.parentNode.removeChild(detailRow);
+      });
+    }
     tr.querySelector('[data-act="send"]').onclick = async () => {
       report((await api(`/api/notifications/${n.id}/send`, { method: "POST" })).data); load();
     };

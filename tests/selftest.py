@@ -2,17 +2,22 @@
 """关键情形端到端自测（仅依赖 Python 标准库）。
 
 覆盖：
-  S1  正常发送 → 已确认
-  S2  同内容重试只记一次（两端均不重复）
+  S1  正常发送 → 已确认，且首次入账归因到第 1 次尝试
+  S2  同内容重试只记一次（两端均不重复），重试不改写首次入账标识
   S3  同键不同内容 → 409 冲突（发送端登记与接收端直连均验证）
-  S4  入库后丢回执 → 待核 → 重发去重 → 已确认
-  S5  入库后丢回执 → 待核 → 核对补账 → 已确认
+  S4  入库后丢回执 → 待核（归因未知）→ 重发去重 → 已确认且归因仍指向第 1 次
+  S5  入库后丢回执 → 待核 → 核对补账 → 已确认并补全归因
   S6  慢回执（发送端超时）→ 待核 → 核对 → 已确认
-  S7  并发同内容提交 → 两端各仅一条
+  S7  并发同内容提交 → 两端各仅一条，且首次入账尝试唯一
   S8  并发不同内容 → 仅一条，败者 409
   S9  接收端不可用 → 待核且不虚报成功（--lifecycle）
   S10 发送端重启（接收端停机中）→ 待核持久 → 恢复后凭回执补核（--lifecycle）
-  S11 发送端重启（接收端正常）→ 启动自动核对凭回执结案（--lifecycle）
+  S11 发送端重启（接收端正常）→ 启动自动核对凭回执结案并补全归因（--lifecycle）
+  S12 接收端失联时核对 → 状态不变、归因显示未知（--lifecycle）
+  S13 尝试记录落库失败 → 500 且绝不向接收端发出请求
+  S14 旧回执无尝试标识 → 显示“无法追溯”
+  S15 首次入账后交错重试（并发）→ 首次入账标识不被改写
+  S16 发送与核对交错（并发）→ 已确认不被晚到结论降级
 
 用法：
   python3 tests/selftest.py [--lifecycle]
@@ -76,6 +81,10 @@ def sender_send(nid, simulate=None):
     return req("POST", url)
 
 
+def sender_get(nid):
+    return req("GET", f"{SENDER}/api/notifications/{nid}")
+
+
 def sender_reconcile(nid):
     return req("POST", f"{SENDER}/api/notifications/{nid}/reconcile")
 
@@ -88,6 +97,11 @@ def sender_rows(rel):
 def receiver_rows(rel):
     _, d = req("GET", RECEIVER + "/api/receipts")
     return [x for x in d.get("items", []) if x["env"] == ENV and x["release_no"] == rel]
+
+
+def receiver_receipt(rel):
+    _, d = req("GET", f"{RECEIVER}/api/receipts?env={ENV}&release_no={rel}")
+    return d
 
 
 def hook(env_var, default_cmd):
@@ -121,6 +135,14 @@ def s1_basic():
     code, n2 = sender_send(n["id"])
     check("S1 发送后已确认且有回执号", n2.get("status") == "ACKED" and bool(n2.get("receipt_id")), f"{n2}")
     check("S1 接收端仅一条记录", len(receiver_rows(k)) == 1, f"{receiver_rows(k)}")
+    attempts = n2.get("attempts") or []
+    check("S1 发送端保存了 1 次尝试且标记首次入账",
+          len(attempts) == 1 and attempts[0]["outcome"] == "RECORDED", f"{attempts}")
+    check("S1 首次入账归因到第 1 次尝试",
+          n2.get("attribution") == "TRACED" and n2.get("first_attempt_no") == 1, f"{n2}")
+    receipt = receiver_receipt(k)
+    check("S1 接收端回执保存了同一尝试标识",
+          receipt.get("first_attempt_id") == attempts[0]["attempt_id"], f"{receipt} vs {attempts}")
 
 
 def s2_retry_dedup():
@@ -131,6 +153,26 @@ def s2_retry_dedup():
     check("S2 重发后仍为已确认", n2.get("status") == "ACKED", f"{n2}")
     check("S2 发送端同键仅一条", len(sender_rows(k)) == 1)
     check("S2 接收端同键仍仅一条", len(receiver_rows(k)) == 1)
+    check("S2 已确认后重发不新增尝试", len(n2.get("attempts") or []) == 1, f"{n2.get('attempts')}")
+
+
+def s2b_retry_after_pending():
+    """未确认前的同内容重试：新增尝试，但接收端首次入账标识不被改写。"""
+    k = key("k2b")
+    code, n = sender_create(ENV, k, "success")
+    # 先清空本地状态模拟“发送端未保存回执”，再直接并发打接收端两次相同内容
+    first_id = f"itest-{RUN}-k2b-a"
+    second_id = f"itest-{RUN}-k2b-b"
+    c1, r1 = req("POST", RECEIVER + "/api/receipts",
+                 {"env": ENV, "release_no": k, "result": "success", "attempt_id": first_id})
+    c2, r2 = req("POST", RECEIVER + "/api/receipts",
+                 {"env": ENV, "release_no": k, "result": "success", "attempt_id": second_id})
+    check("S2b 接收端首次入账返回 201 并保存首个标识",
+          c1 == 201 and r1.get("first_attempt_id") == first_id, f"{c1} {r1}")
+    check("S2b 同内容重试 200 且返回原标识（不把重试算首次入账）",
+          c2 == 200 and r2.get("deduplicated") is True and r2.get("first_attempt_id") == first_id,
+          f"{c2} {r2}")
+    check("S2b 接收端仍仅一条", len(receiver_rows(k)) == 1, f"{receiver_rows(k)}")
 
 
 def s3_conflict():
@@ -151,10 +193,18 @@ def s4_lost_response_resend():
     nid = n["id"]
     code, n2 = sender_send(nid, simulate="lose_response")
     check("S4 丢回执后为待核而非成功", n2.get("status") == "UNCERTAIN", f"{n2}")
+    check("S4 丢回执时首次入账尝试显示未知", n2.get("attribution") == "UNKNOWN", f"{n2}")
     check("S4 接收端其实已记账（1 条）", len(receiver_rows(k)) == 1, f"{receiver_rows(k)}")
+    first = (n2.get("attempts") or [{}])[0].get("attempt_id")
     code, n3 = sender_send(nid)
     check("S4 重发后凭回执确认", n3.get("status") == "ACKED", f"{n3}")
     check("S4 重发未产生重复记录", len(receiver_rows(k)) == 1, f"{receiver_rows(k)}")
+    check("S4 归因回到第 1 次尝试（重发不是首次入账）",
+          n3.get("attribution") == "TRACED" and n3.get("first_attempt_no") == 1
+          and n3.get("first_attempt_id") == first, f"{n3}")
+    attempts = n3.get("attempts") or []
+    check("S4 尝试记录为 HTTP 异常(回执丢失) + 幂等命中",
+          [a["outcome"] for a in attempts] == ["HTTP_ERROR", "DEDUP"], f"{attempts}")
 
 
 def s5_lost_response_reconcile():
@@ -165,6 +215,9 @@ def s5_lost_response_reconcile():
     check("S5 丢回执后状态为待核", sender_rows(k)[0]["status"] == "UNCERTAIN")
     code, n3 = sender_reconcile(nid)
     check("S5 核对后凭接收端回执确认", n3.get("status") == "ACKED" and bool(n3.get("receipt_id")), f"{n3}")
+    check("S5 核对补全归因到第 1 次尝试",
+          n3.get("attribution") == "TRACED" and n3.get("first_attempt_no") == 1
+          and bool(n3.get("receipt_first_attempt_id")), f"{n3}")
     check("S5 接收端仍仅一条", len(receiver_rows(k)) == 1)
 
 
@@ -201,6 +254,12 @@ def s7_concurrent_same():
     check("S7 并发同内容：接收端仅一条", len(receiver_rows(k)) == 1, f"{receiver_rows(k)}")
     rows = sender_rows(k)
     check("S7 并发同内容：最终已确认", bool(rows) and rows[0]["status"] == "ACKED", f"{rows}")
+    attempts = (rows[0].get("attempts") if rows else None) or []
+    recorded = [a for a in attempts if a["outcome"] == "RECORDED"]
+    check("S7 并发同内容：仅一次尝试被标记首次入账", len(recorded) == 1, f"{attempts}")
+    check("S7 并发同内容：归因指向被标记的那次尝试",
+          bool(rows) and rows[0].get("first_attempt_id") == (recorded[0]["attempt_id"] if recorded else None),
+          f"{rows}")
 
 
 def s8_concurrent_diff():
@@ -292,7 +351,142 @@ def s11_auto_reconcile_after_restart():
             break
         time.sleep(0.5)
     check("S11 重启后自动凭接收端回执结案", final is not None, f"{sender_rows(k)}")
+    check("S11 重启后归因补全到第 1 次尝试",
+          final is not None and final.get("attribution") == "TRACED"
+          and final.get("first_attempt_no") == 1, f"{final}")
     check("S11 接收端仍仅一条", len(receiver_rows(k)) == 1)
+
+
+def s12_reconcile_while_receiver_down():
+    """接收端失联时核对：状态不变，首次入账尝试显示未知（--lifecycle）。"""
+    k = key("k12")
+    code, n = sender_create(ENV, k, "success")
+    nid = n["id"]
+    sender_send(nid, simulate="lose_response")  # 接收端已入账、回执丢失
+    hook("RN_HOOK_STOP_RECEIVER", "docker compose stop receiver")
+    time.sleep(1)
+    code, n2 = sender_reconcile(nid)
+    check("S12 接收端失联时核对不虚报成功", n2.get("status") == "UNCERTAIN", f"{n2}")
+    check("S12 接收端失联时首次入账尝试显示未知", n2.get("attribution") == "UNKNOWN", f"{n2}")
+    hook("RN_HOOK_START_RECEIVER", "docker compose start receiver")
+    if not wait_up(RECEIVER):
+        check("S12 接收端恢复", False)
+        return
+    code, n3 = sender_reconcile(nid)
+    check("S12 恢复后凭回执补全归因",
+          n3.get("status") == "ACKED" and n3.get("attribution") == "TRACED"
+          and n3.get("first_attempt_no") == 1, f"{n3}")
+    check("S12 接收端仍仅一条", len(receiver_rows(k)) == 1)
+
+
+def s13_attempt_disk_fail_never_sends():
+    """尝试记录落库失败时必须 500 且绝不发出请求（否则会产生无法追溯的回执）。"""
+    k = key("k13")
+    code, n = sender_create(ENV, k, "success")
+    nid = n["id"]
+    code, resp = sender_send(nid, simulate="fail_attempt_db")
+    check("S13 尝试记录落库失败返回 500", code == 500, f"{code} {resp}")
+    check("S13 失败后无尝试记录", not (resp.get("attempts") or []), f"{resp.get('attempts')}")
+    check("S13 接收端未收到任何请求（无回执）", len(receiver_rows(k)) == 0, f"{receiver_rows(k)}")
+    rows = sender_rows(k)
+    check("S13 本地仍为待发送且尝试数为 0",
+          bool(rows) and rows[0]["status"] == "PENDING" and rows[0]["attempt_count"] == 0, f"{rows}")
+    code, n2 = sender_send(nid)
+    check("S13 故障恢复后可正常发送并归因",
+          n2.get("status") == "ACKED" and n2.get("attribution") == "TRACED"
+          and n2.get("first_attempt_no") == 1, f"{n2}")
+
+
+def s14_legacy_receipt_untraceable():
+    """旧回执（无尝试标识）必须显示无法追溯，而不是误归因。"""
+    k = key("k14")
+    code, n = sender_create(ENV, k, "success")
+    nid = n["id"]
+    # 模拟旧客户端 / 旧代码直接入账：不带 attempt_id
+    code, r = req("POST", RECEIVER + "/api/receipts",
+                  {"env": ENV, "release_no": k, "result": "success"})
+    check("S14 接收端接受不带标识的旧式入账（201）", code == 201, f"{code} {r}")
+    check("S14 旧回执 first_attempt_id 为空", r.get("first_attempt_id") is None, f"{r}")
+    code, n2 = sender_reconcile(nid)
+    check("S14 核对后状态已确认", n2.get("status") == "ACKED", f"{n2}")
+    check("S14 旧回执显示无法追溯", n2.get("attribution") == "UNTRACEABLE", f"{n2}")
+    check("S14 接收端仍仅一条", len(receiver_rows(k)) == 1)
+
+
+def s15_interleaved_first_entry():
+    """首次入账后并发交错重试：接收端只保留首次标识，发送端归因仍指向首次。"""
+    k = key("k15")
+    code, n = sender_create(ENV, k, "success")
+    nid = n["id"]
+    code, n2 = sender_send(nid, simulate="lose_response")  # 第 1 次已入账、回执丢失
+    first = (n2.get("attempts") or [{}])[0].get("attempt_id")
+    results = []
+
+    def worker():
+        try:
+            c, body = sender_send(nid)
+            results.append((c, body.get("status")))
+        except Exception as e:  # noqa: BLE001
+            results.append(("EXC", str(e)))
+
+    threads = [threading.Thread(target=worker) for _ in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    check("S15 交错重试无线程异常", all(r[0] != "EXC" for r in results), f"{results}")
+    check("S15 交错重试后均不误报非成功状态",
+          all(r[0] == 200 and r[1] == "ACKED" for r in results), f"{results}")
+    rows = sender_rows(k)
+    check("S15 发送端最终已确认", bool(rows) and rows[0]["status"] == "ACKED", f"{rows}")
+    check("S15 归因仍指向第 1 次尝试",
+          bool(rows) and rows[0].get("attribution") == "TRACED"
+          and rows[0].get("first_attempt_no") == 1 and rows[0].get("first_attempt_id") == first,
+          f"{rows}")
+    receipt = receiver_receipt(k)
+    check("S15 接收端首次入账标识未被重试改写",
+          receipt.get("first_attempt_id") == first, f"{receipt} vs {first}")
+    check("S15 接收端仅一条", len(receiver_rows(k)) == 1)
+    attempts = (rows[0].get("attempts") if rows else None) or []
+    outcomes = [a["outcome"] for a in attempts]
+    check("S15 仅第 1 次尝试标记 RECORDED（回执丢失故如实记 HTTP_ERROR）",
+          outcomes.count("RECORDED") == 0 and outcomes[0] == "HTTP_ERROR"
+          and set(outcomes[1:]) == {"DEDUP"} and len(outcomes) >= 2, f"{attempts}")
+
+
+def s16_interleaved_reconcile_and_send():
+    """发送与核对交错：已确认不得被晚到的失败/无记录结论降级。"""
+    k = key("k16")
+    code, n = sender_create(ENV, k, "success")
+    nid = n["id"]
+    codes = []
+
+    def worker(i):
+        try:
+            if i % 2:
+                c, body = sender_send(nid)
+            else:
+                c, body = sender_reconcile(nid)
+            codes.append((c, body.get("status")))
+        except Exception as e:  # noqa: BLE001
+            codes.append(("EXC", str(e)))
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    check("S16 交错操作无线程异常", all(c[0] != "EXC" for c in codes), f"{codes}")
+    code, final = sender_get(nid)
+    recorded = [a for a in (final.get("attempts") or []) if a["outcome"] == "RECORDED"]
+    # 尝试序号按本地落库顺序分配，接收端按请求到达顺序处理，
+    # 并发下首次入账未必是第 1 次尝试；关键是唯一、且归因指向它。
+    check("S16 交错后最终已确认且归因唯一指向首次入账尝试",
+          final.get("status") == "ACKED" and final.get("attribution") == "TRACED"
+          and len(recorded) == 1
+          and final.get("first_attempt_id") == recorded[0]["attempt_id"]
+          and final.get("first_attempt_no") == recorded[0]["attempt_no"], f"{final}")
+    check("S16 接收端仅一条", len(receiver_rows(k)) == 1, f"{receiver_rows(k)}")
 
 
 def main():
@@ -304,16 +498,22 @@ def main():
 
     s1_basic()
     s2_retry_dedup()
+    s2b_retry_after_pending()
     s3_conflict()
     s4_lost_response_resend()
     s5_lost_response_reconcile()
     s6_slow_response()
     s7_concurrent_same()
     s8_concurrent_diff()
+    s13_attempt_disk_fail_never_sends()
+    s14_legacy_receipt_untraceable()
+    s15_interleaved_first_entry()
+    s16_interleaved_reconcile_and_send()
     if lifecycle:
         nid_k9 = s9_receiver_down()
         s10_sender_restart_while_down(nid_k9)
         s11_auto_reconcile_after_restart()
+        s12_reconcile_while_receiver_down()
 
     print(f"\n通过 {len(PASSED)} 项，失败 {len(FAILED)} 项")
     if FAILED:

@@ -1,8 +1,10 @@
 """审计接收端（本地演示用）。
 
 接收“部署完成通知”，按 (env, release_no) 幂等入库，并提供回执查询。
-- 相同 (env, release_no) 且内容一致的重试：返回既有回执，不新增记录；
+- 首次入账时记下发送端提供的 attempt_id（作为 first_attempt_id），此后永不改写；
+- 相同 (env, release_no) 且内容一致的重试：返回既有回执（含原 first_attempt_id），不新增记录；
 - 相同 (env, release_no) 但内容不同：409 冲突；
+- 不存在 attempt_id 的旧客户端 / 旧回执：first_attempt_id 为 null，供发送端标记“无法追溯”；
 - 故障注入（仅演示）：simulate=lose_response（入库后丢响应）/ slow（入库后慢响应）。
 """
 from __future__ import annotations
@@ -10,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import time
 from contextlib import asynccontextmanager
@@ -22,6 +25,7 @@ from pydantic import BaseModel
 DB_PATH = os.environ.get("DB_PATH", "/data/receiver.db")
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 VALID_SIMULATE = {"lose_response", "slow"}
+ATTEMPT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
 def now_iso() -> str:
@@ -57,11 +61,16 @@ def init_db() -> None:
                 release_no TEXT NOT NULL,
                 result TEXT NOT NULL,
                 content_hash TEXT NOT NULL,
+                first_attempt_id TEXT,
                 received_at TEXT NOT NULL,
                 UNIQUE(env, release_no)
             )
             """
         )
+        # 旧库迁移：旧回执没有尝试标识，first_attempt_id 为 NULL（发送端据此显示“无法追溯”）
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(receipts)").fetchall()}
+        if "first_attempt_id" not in cols:
+            conn.execute("ALTER TABLE receipts ADD COLUMN first_attempt_id TEXT")
     finally:
         conn.close()
 
@@ -88,6 +97,7 @@ class ReceiptIn(BaseModel):
     env: str
     release_no: str
     result: str
+    attempt_id: str | None = None  # 发送端本次尝试标识；首次入账时保存，重试不改写
     simulate: str | None = None  # lose_response | slow
 
 
@@ -105,6 +115,9 @@ def create_receipt(body: ReceiptIn):
         return JSONResponse(status_code=400, content={"detail": "字段长度不能超过 64 字符"})
     if body.simulate is not None and body.simulate not in VALID_SIMULATE:
         return JSONResponse(status_code=400, content={"detail": f"simulate 仅支持：{sorted(VALID_SIMULATE)}"})
+    attempt_id = (body.attempt_id or "").strip() or None
+    if attempt_id is not None and not ATTEMPT_ID_RE.match(attempt_id):
+        return JSONResponse(status_code=400, content={"detail": "attempt_id 仅支持 1-64 位字母/数字/下划线/短横线"})
 
     ch = content_hash(env, release_no, result)
     conn = connect()
@@ -117,7 +130,8 @@ def create_receipt(body: ReceiptIn):
             if row is not None:
                 conn.execute("COMMIT")
                 if row["content_hash"] == ch:
-                    # 同内容重试：幂等返回既有回执，绝不重复记账
+                    # 同内容重试：幂等返回既有回执与原 first_attempt_id，绝不重复记账、
+                    # 也绝不把后来的重试改写成“首次入账”。
                     out = row_to_dict(row)
                     out["deduplicated"] = True
                     return JSONResponse(status_code=200, content=out)
@@ -126,8 +140,10 @@ def create_receipt(body: ReceiptIn):
                     "existing": row_to_dict(row),
                 })
             cur = conn.execute(
-                "INSERT INTO receipts (env, release_no, result, content_hash, received_at) VALUES (?,?,?,?,?)",
-                (env, release_no, result, ch, now_iso()),
+                """INSERT INTO receipts
+                   (env, release_no, result, content_hash, first_attempt_id, received_at)
+                   VALUES (?,?,?,?,?,?)""",
+                (env, release_no, result, ch, attempt_id, now_iso()),
             )
             rid = cur.lastrowid
             conn.execute("COMMIT")

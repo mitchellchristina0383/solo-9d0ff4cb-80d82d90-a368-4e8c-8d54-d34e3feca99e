@@ -16,6 +16,7 @@
   th { color: #7b8794; font-weight: 600; }
   code { background: #eef1f4; padding: 1px 5px; border-radius: 4px; font-size: 12px; }
   .muted { color: #9aa5b1; font-size: 12px; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; }
 </style>
 </head>
 <body>
@@ -26,11 +27,13 @@
 <main>
   <section class="card">
     <p class="muted">
-      接口：<code>POST /api/receipts</code>（body 可带 <code>"simulate":"lose_response"</code> 模拟入库后丢响应，
-      或 <code>"slow"</code> 模拟慢回执）· <code>GET /api/receipts?env=...&amp;release_no=...</code> 查询回执
+      接口：<code>POST /api/receipts</code>（首次入账时保存请求中的 <code>attempt_id</code> 为
+      <code>first_attempt_id</code>，此后同内容重试始终返回原值且不改写；body 还可带
+      <code>"simulate":"lose_response"</code> 模拟入库后丢响应，或 <code>"slow"</code> 模拟慢回执）·
+      <code>GET /api/receipts?env=...&amp;release_no=...</code> 查询回执
     </p>
     <table>
-      <thead><tr><th>ID</th><th>环境</th><th>发布号</th><th>结果</th><th>入账时间 (UTC)</th></tr></thead>
+      <thead><tr><th>ID</th><th>环境</th><th>发布号</th><th>结果</th><th>首次入账尝试标识</th><th>入账时间 (UTC)</th></tr></thead>
       <tbody id="rows"></tbody>
     </table>
   </section>
@@ -44,8 +47,12 @@ async function load() {
   tbody.innerHTML = "";
   for (const n of (data.items || [])) {
     const tr = document.createElement("tr");
+    const faid = n.first_attempt_id
+      ? '<span class="mono">' + esc(n.first_attempt_id) + "</span>"
+      : '<span class="muted">无法追溯（旧回执无标识）</span>';
     tr.innerHTML = "<td>" + n.id + "</td><td>" + esc(n.env) + "</td><td>" + esc(n.release_no) +
-      "</td><td>" + esc(n.result) + "</td><td class='muted'>" + esc(n.received_at) + "</td>";
+      "</td><td>" + esc(n.result) + "</td><td>" + faid +
+      "</td><td class='muted'>" + esc(n.received_at) + "</td>";
     tbody.appendChild(tr);
   }
 }
